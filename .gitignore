@@ -1,0 +1,8 @@
+.build/
+dist/
+*.log
+.DS_Store
+verification/preview.png
+verification/tools/hid-pinch
+verification/paging-midpoint.png
+verification/
