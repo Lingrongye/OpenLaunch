@@ -2,18 +2,6 @@ import AppKit
 import OpenLaunchCore
 
 private extension NSRect { var center: NSPoint { NSPoint(x: midX, y: midY) } }
-private final class VerticallyCenteredSearchFieldCell: NSSearchFieldCell {
-    override func titleRect(forBounds bounds: NSRect) -> NSRect {
-        var title = super.titleRect(forBounds: bounds)
-        title.origin.y = bounds.minY + (bounds.height - title.height) / 2
-        return title
-    }
-    override func drawingRect(forBounds bounds: NSRect) -> NSRect {
-        var drawing = super.drawingRect(forBounds: bounds)
-        drawing.origin.y = bounds.minY + (bounds.height - drawing.height) / 2
-        return drawing
-    }
-}
 extension NSPasteboard.PasteboardType { static let launcherItem = NSPasteboard.PasteboardType("local.openlaunch.item") }
 final class LauncherPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -110,7 +98,8 @@ final class IconTile: NSView, NSDraggingSource {
     var hasArtworkHover: Bool { hoverIsActive }
     var hasPreparedTitle: Bool { titlePixels.contents != nil }
     weak var owner: LauncherController?
-    var node: LayoutNode? { didSet { clearHover() } }
+    var node: LayoutNode? { didSet { clearInteraction() } }
+    private(set) lazy var feedback = IconFeedback(image: image, highlight: hoverLayer)
     private var down: NSEvent?
     private var dragged = false
     override init(frame: NSRect) {
@@ -179,14 +168,19 @@ final class IconTile: NSView, NSDraggingSource {
     override func mouseEntered(with event: NSEvent) { updateHover(at: event.locationInWindow) }
     override func mouseMoved(with event: NSEvent) { updateHover(at: event.locationInWindow) }
     func updateHover(at windowPoint: NSPoint) {
+        guard !feedback.isActive else { return }
         let shouldHover = owner?.allowsTileInteraction == true && containsIconArtwork(windowPoint)
         guard hoverIsActive != shouldHover else { return }
         hoverIsActive = shouldHover
         hoverLayer.opacity = shouldHover ? 1 : 0
     }
-    func clearHover() { hoverIsActive = false; hoverLayer.opacity = 0 }
-    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); clearHover() }
-    override func mouseExited(with event: NSEvent) { clearHover() }
+    func clearHover() { hoverIsActive = false; if !feedback.isActive { hoverLayer.opacity = 0 } }
+    func clearInteraction() { down = nil; dragged = false; feedback.reset(); clearHover() }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); clearInteraction() }
+    override func mouseExited(with event: NSEvent) {
+        if down != nil && !dragged { feedback.reset() }
+        clearHover()
+    }
     func setIcon(_ value: NSImage?) {
         image.image = value
         alphaMask.removeAll(keepingCapacity: true)
@@ -216,11 +210,21 @@ final class IconTile: NSView, NSDraggingSource {
         let y = min(Int(alphaMaskSize.height) - 1, max(0, Int((point.y - artwork.minY) / artwork.height * alphaMaskSize.height)))
         return alphaMask[y * Int(alphaMaskSize.width) + x] > 16
     }
-    override func mouseDown(with event: NSEvent) { down = event; dragged = false }
-    override func mouseUp(with event: NSEvent) { if !dragged, down != nil, owner?.allowsTileInteraction == true, containsIconArtwork(event.locationInWindow), let node { owner?.activate(node) }; down = nil }
+    override func mouseDown(with event: NSEvent) {
+        guard owner?.allowsTileInteraction == true, containsIconArtwork(event.locationInWindow) else { return }
+        down = event; dragged = false; feedback.press()
+    }
+    override func mouseUp(with event: NSEvent) {
+        guard down != nil else { return }
+        let shouldActivate = !dragged && down != nil && owner?.allowsTileInteraction == true && containsIconArtwork(event.locationInWindow)
+        down = nil
+        if shouldActivate, let node { owner?.activate(node) }
+        else { feedback.reset(); updateHover(at: event.locationInWindow) }
+    }
     override func mouseDragged(with event: NSEvent) {
         guard !dragged, let node, let down, hypot(event.locationInWindow.x - down.locationInWindow.x, event.locationInWindow.y - down.locationInWindow.y) > 5 else { return }
-        dragged = true
+        guard owner?.allowsTileInteraction == true else { clearInteraction(); return }
+        dragged = true; feedback.reset(); clearHover()
         let pb = NSPasteboardItem(); pb.setString(node.id, forType: .launcherItem)
         if case .application(let id) = node { pb.setString(URL(fileURLWithPath: id).absoluteString, forType: .fileURL) }
         let item = NSDraggingItem(pasteboardWriter: pb)
@@ -228,8 +232,8 @@ final class IconTile: NSView, NSDraggingSource {
         beginDraggingSession(with: [item], event: event, source: self)
     }
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { context == .withinApplication ? .move : .copy }
-    override func accessibilityPerformPress() -> Bool { guard let node, let owner else { return false }; owner.activate(node); return true }
-    override func rightMouseDown(with event: NSEvent) { if let node { owner?.contextMenu(node, event: event, view: self) } }
+    override func accessibilityPerformPress() -> Bool { guard let node, let owner, owner.allowsTileInteraction else { return false }; owner.activate(node); return true }
+    override func rightMouseDown(with event: NSEvent) { if owner?.allowsTileInteraction == true, let node { owner?.contextMenu(node, event: event, view: self) } }
 }
 final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegate, NSSearchFieldDelegate {
     let window: LauncherPanel
@@ -246,7 +250,12 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     private var paging = false
     private var settlingTarget: Int?
     private var nativeContinuityError = 0.0
-    var allowsTileInteraction: Bool { !paging && !pinchRevealing && !revealAnimating }
+    var allowsTileInteraction: Bool { !paging && !pinchRevealing && !revealAnimating && pendingLaunch == nil }
+    private var pendingLaunch: UUID?
+    private weak var launchTile: IconTile?
+    private var openApplication: (URL, NSWorkspace.OpenConfiguration, @escaping (NSRunningApplication?, Error?) -> Void) -> Void = {
+        NSWorkspace.shared.openApplication(at: $0, configuration: $1, completionHandler: $2)
+    }
     private let reportQueue = DispatchQueue(label: "local.openlaunch.paging-reports", qos: .utility)
     private var currentOffset: Double = 0
     let countLabel = NSTextField(labelWithString: "")
@@ -284,6 +293,8 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     private var folder: String?
     private var query = ""
     private var settings: NSWindow?
+    private var loginStartup = LoginStartup()
+    private let loginStartupButton = NSButton(checkboxWithTitle: "登录后自动启动", target: nil, action: nil)
     private let input: InputController
     var onHide: (() -> Void)?
     var onQuit: (() -> Void)?
@@ -332,6 +343,15 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         }
         clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             guard let self, event.window === self.window, self.window.isVisible else { return event }
+            if let root = self.window.contentView,
+               self.searchSurface.frame.contains(root.convert(event.locationInWindow, from: nil)) {
+                let point = self.searchSurface.convert(event.locationInWindow, from: nil)
+                if !self.search.frame.contains(point), !self.settingsButton.frame.contains(point) {
+                    self.window.makeFirstResponder(self.search)
+                    return nil
+                }
+                return event
+            }
             guard self.allowsTileInteraction else { return nil }
             if self.shouldDismissBackground(at: event.locationInWindow) { self.dismiss(); return nil }
             return event
@@ -354,8 +374,8 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         searchSurface.wantsLayer = true; searchSurface.layer?.cornerRadius = 24; searchSurface.layer?.masksToBounds = true
         searchSurface.layer?.borderWidth = 0.6; searchSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
         root.addSubview(searchSurface)
-        search.cell = VerticallyCenteredSearchFieldCell(textCell: "")
         search.placeholderString = "搜索应用"; search.font = .systemFont(ofSize: 18)
+        search.isEditable = true; search.isSelectable = true
         search.isBordered = false; search.drawsBackground = false
         if let cell = search.cell as? NSSearchFieldCell { cell.searchButtonCell = nil }
         let magnifier = NSImageView(frame: NSRect(x: 17, y: 15, width: 18, height: 18))
@@ -398,8 +418,11 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         let size = root.bounds.size
         let searchWidth = min(410, size.width - 120)
         searchSurface.frame = NSRect(x: (size.width - searchWidth) / 2, y: size.height - 108, width: searchWidth, height: 48)
-        // Keep AppKit's native search-cell insets and baseline inside the pill.
-        search.frame = NSRect(x: 43, y: -13, width: searchWidth - 90, height: 48)
+        // The field editor lays out from the top of its frame. Center a native
+        // single-line field instead of stretching its editor to the pill height.
+        let searchHeight = ceil(search.cell?.cellSize.height ?? 24)
+        search.frame = NSRect(x: 43, y: (searchSurface.bounds.height - searchHeight) / 2,
+                              width: searchWidth - 90, height: searchHeight)
         settingsButton.frame = NSRect(x: searchWidth - 45, y: 8, width: 32, height: 32)
         backButton.frame = NSRect(x: 42, y: size.height - 76, width: 32, height: 32)
         countLabel.frame = NSRect(x: 86, y: size.height - 72, width: 200, height: 20)
@@ -529,10 +552,12 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     }
     func dismiss() {
         guard window.isVisible else { return }
+        cancelLaunchFeedback()
         pinchSuppressed = pinchSuppressed || pinchRevealing; pinchRevealing = false
         cancelPaging(); clearTileHover(); animateReveal(to: 0, duration: 0.14)
     }
     func hide() {
+        cancelLaunchFeedback()
         pinchSuppressed = pinchSuppressed || pinchRevealing; pinchRevealing = false
         revealToken += 1; revealAnimating = false; revealClosing = false
         pageViewport.layer?.removeAnimation(forKey: "reveal")
@@ -560,7 +585,7 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     func refresh() {
         cancelPaging()
         if !query.isEmpty {
-            items = orderedRecords.filter { !layoutModel.hidden.contains($0.id) && $0.name.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil }.map { .application($0.id) }
+            items = orderedRecords.filter { !layoutModel.hidden.contains($0.id) && $0.matches(query) }.map { .application($0.id) }
         } else if let folder {
             items = layoutModel.children(of: folder).filter { !layoutModel.hidden.contains($0) }.map(LayoutNode.application)
         } else { items = layoutModel.nodes.filter(visible) }
@@ -606,7 +631,7 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     }
     private func clearTileHover() {
         for grid in [previousCollection, collection, nextCollection] {
-            for item in grid.visibleItems() { (item.view as? IconTile)?.clearHover() }
+            for item in grid.visibleItems() { (item.view as? IconTile)?.clearInteraction() }
         }
     }
     private func setPageTranslation(_ offset: Double) {
@@ -616,6 +641,7 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         CATransaction.commit()
     }
     private func beginSwipe() -> Double? {
+        guard pendingLaunch == nil else { return nil }
         var resume = 0.0
         var interruptedPosition: Double?
         var baselineShift = 0.0
@@ -710,7 +736,7 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     }
 
     func turnPage(_ delta: Int) {
-        guard !paging else { return }
+        guard pendingLaunch == nil, !paging else { return }
         let total = max(1, (items.count + pageSize - 1) / pageSize)
         guard page + delta >= 0, page + delta < total else { return }
         paging = true; settlePage(delta: delta, offset: 0)
@@ -718,16 +744,16 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     @objc private func previousPage() { turnPage(-1) }
     @objc private func nextPage() { turnPage(1) }
     @objc private func pageClicked(_ sender: NSButton) {
-        guard !paging else { return }
+        guard pendingLaunch == nil, !paging else { return }
         let delta = sender.tag - page
         if abs(delta) == 1 { turnPage(delta) } else { page = sender.tag; refresh() }
     }
     private func pageNodes(for view: NSCollectionView) -> [LayoutNode] {
         view === previousCollection ? previousDisplayed : (view === nextCollection ? nextDisplayed : displayed)
     }
-    @objc private func goBack() { folder = nil; query = ""; search.stringValue = ""; page = 0; rearrangeFrames() }
+    @objc private func goBack() { cancelLaunchFeedback(); folder = nil; query = ""; search.stringValue = ""; page = 0; rearrangeFrames() }
     func escape() { if folder != nil || !query.isEmpty { goBack() } else { dismiss() } }
-    func controlTextDidChange(_ obj: Notification) { query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines); page = 0; rearrangeFrames() }
+    func controlTextDidChange(_ obj: Notification) { cancelLaunchFeedback(); query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines); page = 0; rearrangeFrames() }
     func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
         if command == #selector(NSResponder.cancelOperation(_:)) { escape(); return true }
         if command == #selector(NSResponder.insertNewline(_:)), !textView.hasMarkedText(), let first = displayed.first { activate(first); return true }
@@ -781,14 +807,29 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         }
         image.unlockFocus(); return image
     }
+    private func cancelLaunchFeedback() {
+        pendingLaunch = nil; launchTile?.clearInteraction(); launchTile = nil
+    }
     func activate(_ node: LayoutNode) {
+        guard allowsTileInteraction else { return }
         switch node {
         case .folder(let id, _, _): folder = id; page = 0; search.stringValue = ""; query = ""; rearrangeFrames()
         case .application(let id):
-            guard let app = records[id] else { alert("这个应用暂时不可用。挂载磁盘或重新安装后，可在设置中刷新应用。布局位置已保留。"); return }
-            let configuration = NSWorkspace.OpenConfiguration(); configuration.activates = true
-            NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { [weak self] _, error in
-                DispatchQueue.main.async { if let error { self?.alert(error.localizedDescription) } else { self?.hide() } }
+            guard let app = records[id] else { clearTileHover(); alert("这个应用暂时不可用。挂载磁盘或重新安装后，可在设置中刷新应用。布局位置已保留。"); return }
+            let token = UUID(); pendingLaunch = token
+            launchTile = collection.visibleItems().compactMap { $0.view as? IconTile }.first { $0.node?.id == id }
+            launchTile?.feedback.launch()
+            // Let the click acknowledgement render before the target takes focus.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
+                guard let self, self.pendingLaunch == token else { return }
+                let configuration = NSWorkspace.OpenConfiguration(); configuration.activates = true
+                self.openApplication(app.url, configuration) { [weak self] _, error in
+                    DispatchQueue.main.async {
+                        guard let self, self.pendingLaunch == token else { return }
+                        self.cancelLaunchFeedback()
+                        if let error { self.alert(error.localizedDescription) } else { self.hide() }
+                    }
+                }
             }
         }
     }
@@ -869,12 +910,21 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     }
     func alert(_ message: String) { let a = NSAlert(); a.messageText = "OpenLaunch"; a.informativeText = message; a.runModal() }
     @objc func showSettings() {
-        if let settings { settings.makeKeyAndOrderFront(nil); return }
-        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 530, height: 430), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        if let settings { refreshLoginStartup(); settings.makeKeyAndOrderFront(nil); return }
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 530, height: 494), styleMask: [.titled, .closable], backing: .buffered, defer: false)
         panel.appearance = NSAppearance(named: .darkAqua)
         panel.title = "OpenLaunch 设置"; panel.isReleasedWhenClosed = false; panel.level = .floating; panel.center()
         let root = panel.contentView!
         func label(_ text: String, y: CGFloat) { let l = NSTextField(labelWithString: text); l.frame = NSRect(x: 28, y: y, width: 450, height: 22); root.addSubview(l) }
+        loginStartupButton.target = self; loginStartupButton.action = #selector(loginStartupChanged(_:))
+        loginStartupButton.frame = NSRect(x: 28, y: 450, width: 240, height: 24)
+        root.addSubview(loginStartupButton)
+        let loginHint = NSTextField(labelWithString: "后台启动，不自动弹出启动台")
+        loginHint.font = .systemFont(ofSize: 11); loginHint.textColor = .secondaryLabelColor
+        loginHint.frame = NSRect(x: 28, y: 426, width: 450, height: 18); root.addSubview(loginHint)
+        let separator = NSBox(); separator.boxType = .separator
+        separator.frame = NSRect(x: 28, y: 416, width: 474, height: 1); root.addSubview(separator)
+        refreshLoginStartup()
         label("唤起方式", y: 392)
         let pinch = NSButton(checkboxWithTitle: "触控板捏合", target: self, action: #selector(settingChanged(_:))); pinch.tag = 1; pinch.state = input.pinchEnabled ? .on : .off; pinch.frame = NSRect(x: 28, y: 354, width: 180, height: 24); root.addSubview(pinch)
         let fingers = NSPopUpButton(frame: NSRect(x: 270, y: 351, width: 150, height: 28)); fingers.addItems(withTitles: ["3 指", "4 指", "5 指"]); fingers.selectItem(at: input.fingerCount - 3); fingers.target = self; fingers.action = #selector(fingersChanged(_:)); root.addSubview(fingers)
@@ -894,6 +944,48 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         statusLabel.stringValue = loadError ?? input.status; statusLabel.font = .systemFont(ofSize: 11); statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 4; statusLabel.lineBreakMode = .byWordWrapping; statusLabel.frame = NSRect(x: 28, y: 22, width: 474, height: 80); root.addSubview(statusLabel)
         settings = panel; panel.makeKeyAndOrderFront(nil)
+    }
+    /// Uses a temporary agent and simulated launchctl; smoke never changes login startup.
+    func verifyLoginSettings(to previewURL: URL) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("OpenLaunch-login-smoke-" + UUID().uuidString)
+        let original = loginStartup
+        var disabled = false
+        loginStartup = LoginStartup(agentURL: directory.appendingPathComponent("login.plist"), run: { args in
+            if args.first == "print-disabled" { return "\"local.openlaunch.login\" => \(disabled)" }
+            disabled = args.first == "disable"; return ""
+        })
+        defer {
+            settings?.orderOut(nil); loginStartup = original
+            try? FileManager.default.removeItem(at: directory)
+        }
+        showSettings()
+        guard loginStartupButton.state == .off else { throw LayoutError.invalid("自启开关初始状态错误") }
+        loginStartupButton.performClick(nil)
+        guard try loginStartup.isEnabled(), loginStartupButton.state == .on else { throw LayoutError.invalid("自启开关无法开启") }
+        loginStartupButton.performClick(nil)
+        guard try !loginStartup.isEnabled(), disabled, loginStartupButton.state == .off else { throw LayoutError.invalid("自启开关无法关闭") }
+        settings?.orderOut(nil); showSettings()
+        guard loginStartupButton.state == .off else { throw LayoutError.invalid("重新打开设置后自启状态错误") }
+        loginStartupButton.performClick(nil)
+        guard try loginStartup.isEnabled(), let view = settings?.contentView,
+              let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw LayoutError.invalid("自启设置预览失败") }
+        view.displayIfNeeded(); view.cacheDisplay(in: view.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else { throw LayoutError.invalid("自启设置预览编码失败") }
+        try png.write(to: previewURL)
+    }
+    private func refreshLoginStartup() {
+        do {
+            loginStartupButton.state = try loginStartup.isEnabled() ? .on : .off
+            loginStartupButton.toolTip = "控制下次登录时是否在后台启动 OpenLaunch"
+        } catch {
+            loginStartupButton.state = .mixed
+            loginStartupButton.toolTip = error.localizedDescription
+        }
+    }
+    @objc private func loginStartupChanged(_ sender: NSButton) {
+        do { try loginStartup.setEnabled(sender.state == .on) }
+        catch { alert(error.localizedDescription) }
+        refreshLoginStartup()
     }
     @objc private func cornerBoxChanged(_ sender: NSButton) {
         let bit = 1 << sender.tag
@@ -934,6 +1026,44 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
         guard window.isVisible && ProcessInfo.processInfo.systemUptime < deadline else { completion(); return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in self?.awaitWindowHidden(until: deadline, completion: completion) }
     }
+    private func verifySearchInteraction(_ completion: @escaping (Bool) -> Void) {
+        func fail(_ reason: String) {
+            fputs("search interaction failure: \(reason)\n", stderr)
+            completion(false)
+        }
+        guard window.isVisible, !revealAnimating, !pinchRevealing, !paging,
+              search.isEditable, search.isSelectable, search.isEnabled,
+              let record = orderedRecords.first else {
+            fail("not ready visible=\(window.isVisible) reveal=\(revealAnimating) pinch=\(pinchRevealing) paging=\(paging) editable=\(search.isEditable) selectable=\(search.isSelectable) enabled=\(search.isEnabled) apps=\(orderedRecords.count)")
+            return
+        }
+        guard window.makeFirstResponder(settingsButton), search.currentEditor() == nil else {
+            fail("could not move focus off the search field before click")
+            return
+        }
+        let point = search.convert(search.bounds.center, to: nil)
+        guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
+              let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime + 0.01, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 0) else { fail("cannot create mouse events"); return }
+        NSApp.postEvent(down, atStart: false); NSApp.postEvent(up, atStart: false)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self, let editor = self.search.currentEditor() as? NSTextView else { fail("click did not activate field editor; firstResponder=\(String(describing: self?.window.firstResponder))"); return }
+            let caret = editor.firstRect(forCharacterRange: NSRange(location: 0, length: 0), actualRange: nil)
+            let center = self.window.convertPoint(toScreen: self.searchSurface.convert(self.searchSurface.bounds.center, to: nil))
+            guard abs(caret.midY - center.y) <= 3 else {
+                fail("search caret not centered: offset=\(caret.midY - center.y) editor=\(editor.frame) caret=\(caret)")
+                return
+            }
+            editor.insertText(record.name, replacementRange: editor.selectedRange())
+            DispatchQueue.main.async {
+                let typedCaret = editor.firstRect(forCharacterRange: NSRange(location: editor.string.utf16.count, length: 0), actualRange: nil)
+                let matched = self.search.stringValue == record.name && self.displayed.contains(.application(record.id)) && abs(typedCaret.midY - center.y) <= 3
+                if !matched { fputs("search interaction mismatch: text=\(self.search.stringValue) expected=\(record.name) displayedMatch=\(self.displayed.contains(.application(record.id)))\n", stderr) }
+                if matched { fputs("search alignment passed: empty=\(caret.midY - center.y)pt typed=\(typedCaret.midY - center.y)pt\n", stderr) }
+                self.goBack()
+                completion(matched)
+            }
+        }
+    }
     func verifyNativeInteractions(completion: @escaping (Bool) -> Void) {
         func failure(_ stage: Int) { fputs("native interaction failure stage=\(stage)\n", stderr); completion(false) }
         hide(); pinchSuppressed = false
@@ -972,7 +1102,71 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
                 self.awaitWindowHidden(until: ProcessInfo.processInfo.systemUptime + 2) { [weak self] in
                     guard let self, !self.window.isVisible else { failure(10); return }
                     self.show()
-                    self.awaitRevealSettle(until: ProcessInfo.processInfo.systemUptime + 2) { completion(true) }
+                    self.awaitRevealSettle(until: ProcessInfo.processInfo.systemUptime + 2) {
+                        self.verifySearchInteraction { passed in
+                            if passed { self.verifyLaunchFeedback(completion: completion) } else { completion(false) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    /// Exercises native mouse feedback and launch ordering without opening a real target.
+    private func verifyLaunchFeedback(completion: @escaping (Bool) -> Void) {
+        guard let tile = collection.visibleItems().compactMap({ $0.view as? IconTile }).first(where: {
+            guard case .application(let id) = $0.node else { return false }; return records[id] != nil
+        }), let node = tile.node else { completion(false); return }
+        let point = tile.convert(tile.image.frame.center, to: nil)
+        func event(_ type: NSEvent.EventType, at location: NSPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: location, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: type == .leftMouseDown ? 1 : 0)!
+        }
+        let original = openApplication
+        var calls = 0
+        var reply: ((NSRunningApplication?, Error?) -> Void)?
+        openApplication = { _, _, completion in calls += 1; reply = completion }
+        func finish(_ passed: Bool) {
+            self.openApplication = original; self.cancelLaunchFeedback()
+            if !passed { fputs("launch feedback verification failed; open calls=\(calls)\n", stderr) }
+            completion(passed)
+        }
+        tile.mouseDown(with: event(.leftMouseDown, at: point))
+        guard tile.feedback.isActive, tile.hoverLayer.opacity == 1 else { finish(false); return }
+        tile.mouseUp(with: event(.leftMouseUp, at: tile.convert(.zero, to: nil)))
+        guard !tile.feedback.isActive, pendingLaunch == nil else { finish(false); return }
+        tile.mouseDown(with: event(.leftMouseDown, at: point))
+        tile.mouseUp(with: event(.leftMouseUp, at: point))
+        tile.mouseDown(with: event(.leftMouseDown, at: point))
+        tile.mouseUp(with: event(.leftMouseUp, at: point))
+        activate(node) // Double click / keyboard repeat must not enqueue a second launch.
+        guard pendingLaunch != nil, tile.feedback.isActive, tile.hoverLayer.borderWidth > 0, calls == 0 else { finish(false); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                guard let presented = tile.image.layer?.presentation(), abs(presented.transform.m11 - 1) > 0.01 else { finish(false); return }
+                let center = CGPoint(x: tile.image.bounds.midX, y: tile.image.bounds.midY)
+                let root = tile.image.layer!.superlayer
+                let animatedCenter = presented.convert(center, to: root)
+                let stableCenter = tile.image.layer!.convert(center, to: root)
+                guard hypot(animatedCenter.x - stableCenter.x, animatedCenter.y - stableCenter.y) < 1 else { finish(false); return }
+            }
+            guard calls == 0 else { finish(false); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
+                guard calls == 1, tile.feedback.isActive, !self.allowsTileInteraction else { finish(false); return }
+                self.hide()
+                guard !tile.feedback.isActive, tile.image.layer?.animation(forKey: "launch") == nil,
+                      tile.hoverLayer.animation(forKey: "launch-wait") == nil else { finish(false); return }
+                self.show()
+                self.awaitRevealSettle(until: ProcessInfo.processInfo.systemUptime + 2) {
+                    reply?(nil, nil) // Completion from the old session cannot hide the reopened launcher.
+                    DispatchQueue.main.async {
+                        guard self.window.isVisible else { finish(false); return }
+                        self.activate(node); self.hide() // Dismiss during the acknowledgement delay cancels dispatch.
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                            guard calls == 1, self.pendingLaunch == nil else { finish(false); return }
+                            self.show()
+                            self.awaitRevealSettle(until: ProcessInfo.processInfo.systemUptime + 2) { finish(self.window.isVisible) }
+                        }
+                    }
                 }
             }
         }
@@ -1015,6 +1209,11 @@ final class LauncherController: NSObject, NSCollectionViewDataSource, NSCollecti
     }
     func smokeCheck() throws -> [String: Any] {
         guard appCount > 0 else { throw LayoutError.invalid("没有扫描到真实应用。") }
+        guard search.frame.minX >= 0, search.frame.minY >= 0,
+              search.frame.maxX <= searchSurface.bounds.maxX,
+              search.frame.maxY <= searchSurface.bounds.maxY else {
+            throw LayoutError.invalid("搜索框的可交互区域越出搜索胶囊并被裁切。")
+        }
         // Exercise actual native buffer identities and hover reuse, not a mock model.
         let incomingLabels = nextDisplayed.indices.compactMap { nextCollection.item(at: IndexPath(item: $0, section: 0))?.view as? IconTile }
         guard incomingLabels.count == nextDisplayed.count, incomingLabels.allSatisfy({ $0.hasPreparedTitle }) else { throw LayoutError.invalid("邻页标题尚未栅格化。") }

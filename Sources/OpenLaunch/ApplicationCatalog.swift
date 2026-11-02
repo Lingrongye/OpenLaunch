@@ -6,6 +6,17 @@ struct ApplicationRecord {
     let url: URL
     let name: String
     let bundleIdentifier: String?
+    let searchAliases: [String]
+
+    init(id: String, url: URL, name: String, bundleIdentifier: String?, searchAliases: [String] = []) {
+        self.id = id; self.url = url; self.name = name
+        self.bundleIdentifier = bundleIdentifier; self.searchAliases = searchAliases
+    }
+    func matches(_ query: String) -> Bool {
+        ([name] + searchAliases).contains {
+            $0.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+        }
+    }
 }
 final class ApplicationCatalog {
     private let icons = NSCache<NSString, NSImage>()
@@ -32,8 +43,17 @@ final class ApplicationCatalog {
                         // then system locations. Keep explicitly different versions.
                         if !bundleVersions.insert(identifier + "|" + version).inserted { continue }
                     }
-                    let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String) ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String) ?? url.deletingPathExtension().lastPathComponent
-                    found.append(ApplicationRecord(id: canonical.path, url: canonical, name: name, bundleIdentifier: bundle.bundleIdentifier))
+                    // With CFBundleAllowMixedLocalizations, Foundation resolves each
+                    // target's resources using the user's language instead of our fallback.
+                    let localized = bundle.localizedInfoDictionary ?? [:]
+                    let name = [localized["CFBundleDisplayName"], localized["CFBundleName"],
+                                bundle.infoDictionary?["CFBundleDisplayName"], bundle.infoDictionary?["CFBundleName"]]
+                        .compactMap { $0 as? String }.first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                        ?? url.deletingPathExtension().lastPathComponent
+                    let aliases = [bundle.infoDictionary?["CFBundleDisplayName"] as? String,
+                                   bundle.infoDictionary?["CFBundleName"] as? String,
+                                   url.deletingPathExtension().lastPathComponent].compactMap { $0 }
+                    found.append(ApplicationRecord(id: canonical.path, url: canonical, name: name, bundleIdentifier: bundle.bundleIdentifier, searchAliases: aliases))
                 } else if url.pathComponents.count - URL(fileURLWithPath: root).pathComponents.count > 3 { iterator.skipDescendants() }
             }
         }

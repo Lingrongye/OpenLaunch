@@ -34,6 +34,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
                     self.controller.verifyNativeInteractions { interactionPassed in
                         guard interactionPassed else { fputs("Smoke failed: native reveal/background interaction\n", stderr); exit(1) }
+                        result["input_live"] = "passed"
+                        result["native_search_alignment"] = "passed"
+                        result["native_click_launch_feedback"] = "passed"
+                        result["launch_duplicate_and_dismiss_cancellation"] = "passed"
                         self.controller.verifyPagingAnimation { animationPassed in
                         do {
                             guard animationPassed else { throw LayoutError.invalid("原生分页动画中断/复位验证失败。") }
@@ -43,6 +47,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             result.merge(self.controller.smokeImageStatus) { _, new in new }
                             try self.controller.exportPagingMidpoint(to: URL(fileURLWithPath: dir).appendingPathComponent("paging-midpoint.png"))
                             try self.controller.exportPreview(to: URL(fileURLWithPath: dir).appendingPathComponent("preview.png"))
+                            try self.controller.verifyLoginSettings(to: URL(fileURLWithPath: dir).appendingPathComponent("settings.png"))
+                            result["native_login_settings_toggle_and_reopen"] = "passed"
                             let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
                             try data.write(to: URL(fileURLWithPath: dir).appendingPathComponent("smoke.json"))
                             print(String(data: data, encoding: .utf8)!)
